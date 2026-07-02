@@ -1,0 +1,117 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
+---
+name: main
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to build (e.g. v1.22.0)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build distribution 📦
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone upstream at tag
+        run: >-
+          git clone --depth 1 --branch '${{ inputs.tag }}'
+          https://github.com/GoogleContainerTools/container-structure-test.git
+          upstream
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build wheels
+        run: |
+          TAG='${{ inputs.tag }}'
+          VERSION_PACKAGE=github.com/GoogleContainerTools/container-structure-test/pkg/version
+          # go-to-wheel requires go.mod next to the main package, but upstream's
+          # main package lives in cmd/container-structure-test. Its files import
+          # everything via full module paths, so they build from the module root.
+          cp upstream/cmd/container-structure-test/*.go upstream/
+          uvx go-to-wheel upstream \
+            --name container-structure-test \
+            --version "${TAG#v}" \
+            --description "Validate the structure of your container images" \
+            --license Apache-2.0 \
+            --url https://github.com/GoogleContainerTools/container-structure-test \
+            --readme upstream/README.md \
+            --ldflags "-X ${VERSION_PACKAGE}.version=${TAG} -X ${VERSION_PACKAGE}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output-dir dist
+
+      - name: Smoke test wheel
+        run: |
+          uv run --with dist/container_structure_test-*manylinux_2_17_x86_64.whl \
+            container-structure-test version | tee version.txt
+          grep -F '${{ inputs.tag }}' version.txt
+
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish-to-pypi:
+    name: upload release to PyPI
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Sign the Python 🐍 distribution 📦 with Sigstore and upload them to GitHub Release
+    needs:
+      - build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # IMPORTANT: mandatory for making GitHub Releases
+      id-token: write # IMPORTANT: mandatory for sigstore
+
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Sign the dists with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: >-
+            ./dist/*.whl
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create
+          '${{ inputs.tag }}'
+          --repo '${{ github.repository }}'
+          --notes 'Python wheels for [container-structure-test ${{ inputs.tag }}](https://github.com/GoogleContainerTools/container-structure-test/releases/tag/${{ inputs.tag }})'
+      - name: Upload artifact signatures to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        # Upload to GitHub Release using the `gh` CLI.
+        # `dist/` contains the built packages, and the
+        # sigstore-produced signatures and certificates.
+        run: >-
+          gh release upload
+          '${{ inputs.tag }}' dist/**
+          --repo '${{ github.repository }}'
