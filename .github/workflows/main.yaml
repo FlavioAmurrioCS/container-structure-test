@@ -15,11 +15,23 @@ jobs:
     name: Build distribution 📦
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - name: Clone upstream at tag
         run: >-
           git clone --depth 1 --branch '${{ inputs.tag }}'
           https://github.com/GoogleContainerTools/container-structure-test.git
           upstream
+
+      - name: Apply patches
+        # The glob has to expand here at the workspace root, where patches/
+        # lives, while git runs one directory down in the upstream clone.
+        run: |
+          for p in patches/*.patch; do
+            echo "::group::$p"
+            git -C upstream apply --verbose "${GITHUB_WORKSPACE}/${p}"
+            echo "::endgroup::"
+          done
 
       - uses: actions/setup-go@v5
         with:
@@ -27,6 +39,28 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+
+      - name: Note patches in README
+        # go-to-wheel reads --readme at invocation time, so editing the file
+        # first is enough to reach the wheel metadata and the PyPI page. Patch
+        # subjects come from the patch files, via git mailinfo rather than a
+        # grep because format-patch folds long subjects across lines.
+        run: |
+          {
+            echo "> **Patched build.** This wheel is built from upstream"
+            echo "> [${{ inputs.tag }}](https://github.com/GoogleContainerTools/container-structure-test/releases/tag/${{ inputs.tag }})"
+            echo "> with the following patches applied:"
+            echo ">"
+            for p in patches/*.patch; do
+              subject=$(git mailinfo /dev/null /dev/null < "$p" | sed -n 's/^Subject: //p')
+              echo "> - ${subject}"
+            done
+            echo ">"
+            echo "> Packaging source: https://github.com/${{ github.repository }}"
+            echo
+            cat upstream/README.md
+          } > README.patched.md
+          mv README.patched.md upstream/README.md
 
       - name: Build wheels
         run: |
@@ -43,14 +77,14 @@ jobs:
             --license Apache-2.0 \
             --url https://github.com/GoogleContainerTools/container-structure-test \
             --readme upstream/README.md \
-            --ldflags "-X ${VERSION_PACKAGE}.version=${TAG} -X ${VERSION_PACKAGE}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --ldflags "-X ${VERSION_PACKAGE}.version=${TAG}+patched -X ${VERSION_PACKAGE}.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --output-dir dist
 
       - name: Smoke test wheel
         run: |
           uv run --with dist/container_structure_test-*manylinux_2_17_x86_64.whl \
             container-structure-test version | tee version.txt
-          grep -F '${{ inputs.tag }}' version.txt
+          grep -F '${{ inputs.tag }}+patched' version.txt
 
       - name: Store the distribution packages
         uses: actions/upload-artifact@v4
