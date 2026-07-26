@@ -1,0 +1,111 @@
+From cd806dc446d63d6ff040e89113af4cfac1a93a4a Mon Sep 17 00:00:00 2001
+From: Flavio Amurrio <25621374+FlavioAmurrioCS@users.noreply.github.com>
+Date: Sun, 26 Jul 2026 15:12:13 -0400
+Subject: [PATCH] fix: Repair --pull for private registries and Docker Engine
+ 29+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The --pull flag had three independent defects that combined to make it
+unusable against anything but a public Docker Hub image on an older
+daemon. All three are in the pull block of cmd/.../app/cmd/test.go.
+
+1. The API version was pinned to 1.32.
+
+go-dockerclient tags request fields with the minimum API version that
+introduced them, and PullImageOptions.Platform carries `ver:"1.32"`.
+Since --platform defaults to linux/$GOARCH it is never empty, so
+pathVersionCheck wrote the request path as POST /v1.32/images/create
+whenever the client had no API version of its own. Docker Engine 29
+raised the minimum supported API version to 1.40 and rejects that with
+"client version 1.32 is too old".
+
+The client now asks the daemon which version it speaks and pins to that.
+Probing is safe because /version is itself requested unversioned, so any
+daemon answers it. DOCKER_API_VERSION still wins when set, and both a
+failed probe and an unparseable version degrade to the previous
+unversioned behavior rather than erroring.
+
+Note that upgrading go-dockerclient does not fix this: v1.13.2 still
+carries the same struct tag and an identical pathVersionCheck, and it
+requires go 1.25 against this module's go 1.22.
+
+2. Registry credentials were never sent.
+
+The call passed a zero-value docker.AuthConfiguration{}, and
+headersWithAuth skips any auth that is empty, so no X-Registry-Auth
+header was sent and every pull was anonymous. Being logged in did not
+help: the daemon performs the pull and never reads ~/.docker/config.json
+— the client has to resolve credentials and forward them.
+
+Credentials now come from the credential helper named by credHelpers or
+credsStore, falling back to the plaintext auths entries in the Docker
+config. Resolution failure is deliberately non-fatal so public images
+keep pulling anonymously.
+
+Fixes #253.
+
+3. The registry host was dropped, sending every pull to Docker Hub.
+
+Repository was set from ref.Context().RepositoryStr(), which strips the
+host, and the Registry field is only serialized as a query parameter the
+Engine API ignores — the daemon reads the host from fromImage. So
+`--pull --image ghcr.io/org/app:tag` actually asked Docker Hub for
+org/app, which surfaced as a confusing "pull access denied ... may
+require 'docker login'" naming a repository the user never referenced.
+Using ref.Context().Name() keeps the host in fromImage.
+
+This is also the underlying cause of #193.
+
+Verified with no DOCKER_API_VERSION set, against Engine 29.6.2
+(API 1.55, minimum 1.40): a private ghcr.io image pulls and its tests
+run; a Docker Hub short name still pulls, cold, with layer downloads; an
+emptied DOCKER_CONFIG yields 401 against the correct ghcr.io host for
+the private image while a public image still pulls anonymously; and
+DOCKER_API_VERSION set to both 1.44 and 1.24 is honored verbatim.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ cmd/container-structure-test/app/cmd/test.go | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/container-structure-test/app/cmd/test.go b/cmd/container-structure-test/app/cmd/test.go
+index 069b146..682bb7d 100644
+--- a/cmd/container-structure-test/app/cmd/test.go
++++ b/cmd/container-structure-test/app/cmd/test.go
+@@ -180,13 +180,29 @@ func run(out io.Writer) error {
+ 		if err != nil {
+ 			logrus.Fatalf("error connecting to daemon: %v", err)
+ 		}
++		if os.Getenv("DOCKER_API_VERSION") == "" {
++			if env, verErr := client.Version(); verErr == nil {
++				if versioned, vErr := docker.NewVersionedClientFromEnv(env.Get("ApiVersion")); vErr == nil {
++					client = versioned
++				}
++			}
++		}
++		registry := ref.Context().RegistryStr()
++		auth := docker.AuthConfiguration{}
++		if creds, credErr := docker.NewAuthConfigurationsFromCredsHelpers(registry); credErr == nil && creds != nil {
++			auth = *creds
++		} else if cfgs, cfgErr := docker.NewAuthConfigurationsFromDockerCfg(); cfgErr == nil {
++			if creds, ok := cfgs.Configs[registry]; ok {
++				auth = creds
++			}
++		}
+ 		if err = client.PullImage(docker.PullImageOptions{
+ 			Platform:     opts.Platform,
+-			Repository:   ref.Context().RepositoryStr(),
++			Repository:   ref.Context().Name(),
+ 			Tag:          ref.Identifier(),
+ 			Registry:     ref.Context().RegistryStr(),
+ 			OutputStream: out,
+-		}, docker.AuthConfiguration{}); err != nil {
++		}, auth); err != nil {
+ 			logrus.Fatalf("error pulling remote image %s: %s", opts.ImagePath, err.Error())
+ 		}
+ 	}
+-- 
+2.50.1 (Apple Git-155)
+
